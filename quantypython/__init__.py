@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import numpy as np
+import sympy
 
+from collections.abc import Set
 from fractions import Fraction
 from functools import total_ordering, reduce
 from numbers import Real
 from operator import mul
-from typing import Dict, Union, Tuple
+from typing import Dict, Optional, Tuple, Union
 from warnings import warn
 from weakref import WeakSet
 
@@ -31,6 +33,12 @@ class Quantity:
         self._value = float(value)
         self._coords = coords
         self._refs.add(self)
+
+    def __pos__(self) -> Quantity:
+        return self
+
+    def __neg__(self) -> Quantity:
+        return Quantity(-self._value, self._coords)
 
     def __add__(self, other) -> Quantity:
         if isinstance(other, Quantity):
@@ -122,7 +130,7 @@ class Quantity:
 
     def dim_str(self, mul=' ', power_format='^{}') -> str:
         """ Return a string representation of quantity's dimensionality. """
-        return mul.join(str(dim) + power_format.format(coord) if coord > 1 else str(dim)
+        return mul.join(str(dim) + power_format.format(Fraction(coord)) if coord > 1 else str(dim)
                         for dim, coord in zip(self._dims, self._coords) if coord)
 
     def as_unit(self, name: str) -> Unit:
@@ -159,7 +167,7 @@ class Unit(Quantity):
         return f'<Unit "{self._name}": {self.dim_str()}>'
 
 
-class UnitSystem:
+class UnitSystem(Set):
     """ A system of independent units through which quantities are expressed. """
 
     def __init__(self, *units: Unit):
@@ -174,34 +182,70 @@ class UnitSystem:
             raise DimensionError('unit system is redundant')
         self._units = units
 
+    def __len__(self):
+        return len(self._units)
+
+    def __contains__(self, item):
+        return item in self._units
+
+    def __iter__(self):
+        return iter(self._units)
+
     def __repr__(self):
         return '<UnitSystem: ' + ', '.join(f'"{unit}"' for unit in self._units) + '>'
 
     def __call__(self, quantity: Union[Quantity, Real]) -> Real:
-        """ Obtain quantity's value. """
+        """ Returns the value of a given quantity. """
         return self.data(quantity)[0]
 
     def data(self, quantity: Union[Quantity, Real]) -> Tuple[Real, Dict[Unit, Fraction]]:
-        """ Return quantity's value and its units with their powers."""
+        """ Returns a tuple of two elements: the value of a given quantity and a
+            dictionary containing its units as keys and their powers as corresponding values. """
         if isinstance(quantity, Real):
             return quantity, {}
         if not isinstance(quantity, Quantity):
             raise TypeError(quantity)
-        ab = np.array([*(unit._coords for unit in self._units), quantity._coords]).T  # augmented matrix
-        ab = ab[ab.any(axis=1)]
+        ab = np.array([*(unit._coords for unit in self._units), quantity._coords]).T  # Augmented matrix
+        ab = ab[sympy.Matrix(ab.T).rref()[1], :]  # Drop linearly dependent rows
         a, b = ab[:, :-1], ab[:, -1]
-        if a.shape[0] < a.shape[1]:
+        if a.shape[1] < a.shape[0]:
             raise DimensionError('unit system is incomplete')
         coords = np.linalg.solve(a, b)
         value = reduce(mul, (unit._value ** coord for unit, coord in zip(self._units, coords)), quantity._value)
         coords = {unit: Fraction(coord).limit_denominator() for unit, coord in zip(self._units, coords)}
         return value, coords
 
-    def str(self, quantity: Union[Quantity, Real], *, value_format='.4g', power_format='^{}', parts_format='{} ({})',
-            fraction_format='{}/{}', mul=' * ', div=' / ', denominator_div=True) -> str:
-        """ Make a string representation of a quantity. """
-        mul1, mul2 = (mul, div) if denominator_div else (mul, mul)
+    def str(
+        self,
+        quantity: Union[Quantity, Real],
+        *,
+        value_format: Optional[str] = '.4g',
+        power_format: str = '^{}',
+        parts_format: Optional[str] = '{} ({})',
+        fraction_format: str = '{}/{}',
+        mul: str = ' * ',
+        div: Optional[str] = ' / ',
+        denominator_format: Optional[str] = None,
+        sort_powers: bool = False,
+    ) -> str:
+        """
+        Returns a string representation of a given quantity.
+
+        Args:
+            value_format: Format of the value of the quantity.
+            power_format: Format of powers of units.
+            parts_format: Format of a pair of value and units. If `None`, the value is treated the same as units.
+            fraction_format: Format of numerator and denominator of fractional powers.
+            mul: String used for multiplication.
+            div: String used for division. If `None`, negative powers are used instead of division.
+            denominator_format: Format of a denominator with multiple terms. If `None`, `div` is used instead of `mul`
+                in denominator.
+            sort_powers: Make units with greater powers come first.
+        """
+        mul1, mul2 = (mul, div) if denominator_format is None else (mul, mul)
         value, coords = self.data(quantity)
+        if sort_powers:
+            coords = {unit: power for unit, power in sorted(coords.items(), key=lambda unit, power: -power)}
         format_unit_coord = lambda unit, coord: str(unit) if coord == 1 else str(unit) + power_format.format(
             coord if coord.denominator == 1 else fraction_format.format(coord.numerator, coord.denominator))
         value = None if value_format is None else f'{value:{value_format}}'
@@ -213,7 +257,10 @@ class UnitSystem:
                 return f'{value}{mul1}{terms}'
             return parts_format.format(value, terms)
         numerator = mul1.join(format_unit_coord(unit, coord) for unit, coord in coords.items() if coord > 0)
-        denominator = mul2.join(format_unit_coord(unit, -coord) for unit, coord in coords.items() if coord < 0)
+        denominator_terms = [format_unit_coord(unit, -coord) for unit, coord in coords.items() if coord < 0]
+        denominator = mul2.join(denominator_terms)
+        if denominator_format is not None and len(denominator_terms) > 1:
+            denominator = denominator_format.format(denominator)
         if denominator:
             if numerator:
                 if value is None:
